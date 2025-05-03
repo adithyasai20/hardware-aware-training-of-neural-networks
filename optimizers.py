@@ -1,4 +1,8 @@
 import torch
+from torch import nn, optim
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error, max_error, mean_squared_log_error, median_absolute_error, explained_variance_score
+import scipy.stats as stats
+
 from torch.optim import Optimizer
 import matplotlib.pyplot as plt
 import numpy as np
@@ -668,3 +672,310 @@ class ContinuousOptimizer(Optimizer):
 
         
         
+
+
+
+class MLPFitter1:
+    def __init__(self, x, y, hidden_layers=[32, 32], lr=0.01, epochs=5000, device=None):
+        self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
+        x = torch.tensor(x, dtype=torch.float32, device=self.device).view(-1, 1)
+        y = torch.tensor(y, dtype=torch.float32, device=self.device).view(-1, 1)
+        
+        self.x_mean, self.x_std = x.mean(), x.std()
+        self.y_mean, self.y_std = y.mean(), y.std()
+        
+        x = (x - self.x_mean) / self.x_std
+        y = (y - self.y_mean) / self.y_std
+        
+        self.model = self._build_mlp(1, 1, hidden_layers).to(self.device)
+        self.inverse_model = self._build_mlp(1, 1, hidden_layers).to(self.device)
+        
+        self.criterion = nn.MSELoss()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        self.inverse_optimizer = optim.Adam(self.inverse_model.parameters(), lr=lr)
+        self.epochs = epochs
+        
+        self.x_train, self.y_train = x, y
+        self._train()
+        self._train_inverse()
+
+    def _build_mlp(self, input_dim, output_dim, hidden_layers):
+        layers = []
+        prev_dim = input_dim
+        for h in hidden_layers:
+            layers.append(nn.Linear(prev_dim, h))
+            layers.append(nn.Tanh())
+            prev_dim = h
+        layers.append(nn.Linear(prev_dim, output_dim))
+        return nn.Sequential(*layers)
+
+    def _train(self):
+        for _ in range(self.epochs):
+            self.optimizer.zero_grad()
+            y_pred = self.model(self.x_train)
+            loss = self.criterion(y_pred, self.y_train)
+            loss.backward()
+            self.optimizer.step()
+
+    def _train_inverse(self):
+        for _ in range(self.epochs):
+            self.inverse_optimizer.zero_grad()
+            x_pred = self.inverse_model(self.y_train)
+            loss = self.criterion(x_pred, self.x_train)
+            loss.backward()
+            self.inverse_optimizer.step()
+
+    def predict(self, x):
+        x_shape = x.shape
+        x_device = x.device  # Preserve device
+        x = ((x - self.x_mean.to(x_device)) / self.x_std.to(x_device)).view((-1, 1))
+        return (self.model(x) * self.y_std.to(x_device) + self.y_mean.to(x_device)).view(x_shape)
+
+    def inverse(self, y):
+        y_shape = y.shape
+        y_device = y.device  # Preserve device
+        y = ((y - self.y_mean.to(y_device)) / self.y_std.to(y_device)).view((-1, 1))
+        return (self.inverse_model(y) * self.x_std.to(y_device) + self.x_mean.to(y_device)).view(y_shape)
+
+    def evaluate(self):
+        y_pred = self.model(self.x_train) * self.y_std + self.y_mean
+        x_pred = self.inverse_model(self.y_train) * self.x_std + self.x_mean
+        
+        forward_mse = mean_squared_error(self.y_train.cpu().detach().numpy() * self.y_std.cpu().detach().numpy() + self.y_mean.cpu().detach().numpy(), y_pred.cpu().detach().numpy())
+        forward_r2 = r2_score(self.y_train.cpu().detach().numpy() * self.y_std.cpu().detach().numpy() + self.y_mean.cpu().detach().numpy(), y_pred.cpu().detach().numpy())
+        
+        inverse_mse = mean_squared_error(self.x_train.cpu().detach().numpy() * self.x_std.cpu().detach().numpy() + self.x_mean.cpu().detach().numpy(), x_pred.cpu().detach().numpy())
+        inverse_r2 = r2_score(self.x_train.cpu().detach().numpy() * self.x_std.cpu().detach().numpy() + self.x_mean.cpu().detach().numpy(), x_pred.cpu().detach().numpy())
+        
+        print(f"Forward Mapping (x -> y):\n  MSE: {forward_mse:.6f}, R² Score: {forward_r2:.6f}")
+        print(f"Inverse Mapping (y -> x):\n  MSE: {inverse_mse:.6f}, R² Score: {inverse_r2:.6f}")
+
+    def plot(self):
+        x_vals = self.x_train.cpu().detach().numpy() * self.x_std.cpu().detach().numpy() + self.x_mean.cpu().detach().numpy()
+        y_vals = self.y_train.cpu().detach().numpy() * self.y_std.cpu().detach().numpy() + self.y_mean.cpu().detach().numpy()
+        y_preds = self.model(self.x_train).cpu().detach().numpy() * self.y_std.cpu().detach().numpy() + self.y_mean.cpu().detach().numpy()
+        x_preds = self.inverse_model(self.y_train).cpu().detach().numpy() * self.x_std.cpu().detach().numpy() + self.x_mean.cpu().detach().numpy()
+        
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        
+        axes[0].scatter(x_vals, y_vals, label="Data", color="blue")
+        axes[0].plot(x_vals, y_preds, label="MLP Fit", color="red")
+        axes[0].set_title("Forward Mapping (x -> y)")
+        axes[0].legend()
+        
+        axes[1].scatter(y_vals, x_vals, label="Data", color="blue")
+        axes[1].plot(y_vals, x_preds, label="MLP Inverse Fit", color="red")
+        axes[1].set_title("Inverse Mapping (y -> x)")
+        axes[1].legend()
+        
+        plt.show()
+
+
+    
+    def plot_residuals_probplot(self):
+        # Compute residuals
+        y_true = self.y_train.cpu().detach().numpy() * self.y_std.cpu().detach().numpy() + self.y_mean.cpu().detach().numpy()
+        y_pred = self.model(self.x_train).cpu().detach().numpy() * self.y_std.cpu().detach().numpy() + self.y_mean.cpu().detach().numpy()
+        forward_residuals = y_true - y_pred  # Residuals for forward mapping
+
+        x_true = self.x_train.cpu().detach().numpy() * self.x_std.cpu().detach().numpy() + self.x_mean.cpu().detach().numpy()
+        x_pred = self.inverse_model(self.y_train).cpu().detach().numpy() * self.x_std.cpu().detach().numpy() + self.x_mean.cpu().detach().numpy()
+        inverse_residuals = x_true - x_pred  # Residuals for inverse mapping
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+        # Q-Q plot for forward residuals
+        stats.probplot(forward_residuals.flatten(), dist="norm", plot=axes[0])
+        axes[0].set_title("Q-Q Plot: Forward Residuals (x -> y)")
+
+        # Q-Q plot for inverse residuals
+        stats.probplot(inverse_residuals.flatten(), dist="norm", plot=axes[1])
+        axes[1].set_title("Q-Q Plot: Inverse Residuals (y -> x)")
+
+        plt.tight_layout()
+        plt.show()
+
+
+        
+    def plot_residuals(self):
+        x_vals = self.x_train.cpu().detach().numpy() * self.x_std.cpu().detach().numpy() + self.x_mean.cpu().detach().numpy()
+        y_vals = self.y_train.cpu().detach().numpy() * self.y_std.cpu().detach().numpy() + self.y_mean.cpu().detach().numpy()
+        y_preds = self.model(self.x_train).cpu().detach().numpy() * self.y_std.cpu().detach().numpy() + self.y_mean.cpu().detach().numpy()
+        x_preds = self.inverse_model(self.y_train).cpu().detach().numpy() * self.x_std.cpu().detach().numpy() + self.x_mean.cpu().detach().numpy()
+
+        forward_residuals = y_vals - y_preds
+        inverse_residuals = x_vals - x_preds
+
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+        # Histogram of residuals
+        axes[0, 0].hist(forward_residuals, bins=30, color='blue', alpha=0.7)
+        axes[0, 0].set_title("Forward Residuals Histogram (x -> y)")
+        axes[0, 0].set_xlabel("Residual Value")
+        axes[0, 0].set_ylabel("Frequency")
+
+        axes[0, 1].hist(inverse_residuals, bins=30, color='red', alpha=0.7)
+        axes[0, 1].set_title("Inverse Residuals Histogram (y -> x)")
+        axes[0, 1].set_xlabel("Residual Value")
+        axes[0, 1].set_ylabel("Frequency")
+
+        # Scatter plot of residuals
+        axes[1, 0].scatter(x_vals, forward_residuals, color='blue', alpha=0.5)
+        axes[1, 0].axhline(y=0, color='black', linestyle='dashed')
+        axes[1, 0].set_title("Forward Residuals (x -> y)")
+        axes[1, 0].set_xlabel("x")
+        axes[1, 0].set_ylabel("Residual")
+
+        axes[1, 1].scatter(y_vals, inverse_residuals, color='red', alpha=0.5)
+        axes[1, 1].axhline(y=0, color='black', linestyle='dashed')
+        axes[1, 1].set_title("Inverse Residuals (y -> x)")
+        axes[1, 1].set_xlabel("y")
+        axes[1, 1].set_ylabel("Residual")
+
+        plt.tight_layout()
+        plt.show()
+
+
+class NNApproximationBasedOptimizer(Optimizer):
+    def __init__(self, params, potentiation:list, depression:list, lr=0.01, tau=0.0):
+
+        defaults = {"potentiation":potentiation, "depression":depression, "lr": lr, "tau":tau}
+        super().__init__(params, defaults)
+
+        self.device = self.param_groups[0]['params'][0].device
+
+        self.potentiation_approximator = MLPFitter1(list(range(len(potentiation))), potentiation, device=self.device)
+        self.potentiation_approximator.evaluate()
+        self.depression_approximator = MLPFitter1(list(range(len(depression))), depression, device=self.device)
+        self.depression_approximator.evaluate()
+
+        self.min_conductance = torch.tensor(max(min(potentiation), min(depression)), device=self.device)
+        self.max_conductance = torch.tensor(min(max(potentiation), max(depression)), device=self.device)
+
+        # self.min_conductance = torch.tensor(min(min(potentiation), min(depression)), device=self.device)
+        # self.max_conductance = torch.tensor(max(max(potentiation), max(depression)), device=self.device)
+
+        self.potentiation = {
+            "max" : self.get_state_from_conductance(self.max_conductance),
+            "min" : self.get_state_from_conductance(self.min_conductance)
+        }
+        self.depression = {
+            "max": self.get_state_from_conductance(self.max_conductance, False),
+            "min":self.get_state_from_conductance(self.min_conductance, False)
+        }
+
+        self.min_weight, self.max_weight = -0.5, 0.5
+
+
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.requires_grad:
+
+                    self.state[p] = {
+                        "state": self.get_state_from_conductance(self.map_weights_to_conductances(p.data), False)\
+                        .clamp(self.depression['max'], self.depression['min']), 
+                        "flag": torch.zeros_like(p.data, dtype=torch.bool) 
+                    }
+                    p.data.copy_(self.map_conductances_to_weights(self.get_conductance_from_state(self.state[p]['state'])))
+
+    def step(self):
+        
+        for group in self.param_groups:
+            lr = group['lr']
+            tau = group['tau']
+            for p in group['params']:
+
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                state = self.state[p]['state']
+                flags = self.state[p]['flag']
+
+                # print(f"(grad < -tau) : {(grad < -tau)}, flags : {flags}")
+
+                potentiation_to_decrease_mask = ((grad > tau) & flags)
+                potentiation_to_increase_mask = ((grad < -tau) & flags)
+
+                depression_to_decrease_mask = ((grad > tau).bool() & (~flags))
+                depression_to_increase_mask = ((grad < -tau) & (~flags))
+
+                # print(f"Potentiation to increase : {potentiation_to_increase_mask}")
+                # print(f"potentiation to decrease : {potentiation_to_decrease_mask}")
+                # print(f"depression to increase : {depression_to_increase_mask}")
+                # print(f"depression to decrease : {depression_to_decrease_mask}")
+                # print(f"state [potentiation to increase mask] = {state[potentiation_to_increase_mask]}")
+                # print(f"state : {state}")
+                # print(f"gradient : {grad}")
+
+                state[potentiation_to_increase_mask] -= lr * grad[potentiation_to_increase_mask]
+                state[depression_to_decrease_mask] += lr * grad[depression_to_decrease_mask]
+
+                if potentiation_to_decrease_mask.any():
+                    conductance = self.map_weights_to_conductances(p.data[potentiation_to_decrease_mask])
+                    state[potentiation_to_decrease_mask] = self.get_state_from_conductance(conductance, flag=False) + lr * grad[potentiation_to_decrease_mask]
+                    flags[potentiation_to_decrease_mask] = False
+
+                if depression_to_increase_mask.any():
+                    conductance = self.map_weights_to_conductances(p.data[depression_to_increase_mask])
+                    state[depression_to_increase_mask] = self.get_state_from_conductance(conductance) - lr * grad[depression_to_increase_mask]
+                    flags[depression_to_increase_mask] = True
+
+                # print(f"state after update before clamp : {state}")
+                if flags.any():
+                    state[flags] = state[flags].clamp(self.potentiation['min'], self.potentiation['max'])
+                if (~flags).any():
+                    state[~flags] = state[~flags].clamp(self.depression['max'], self.depression['min'])
+
+                # print(f"state after clamping : {state} ")
+                # print("-------------------------------------------------------------")
+
+
+
+                conductance = torch.where(
+                    flags.bool(),
+                    self.get_conductance_from_state(state),
+                    self.get_conductance_from_state(state, False)
+                )
+
+
+                p.data.copy_(self.map_conductances_to_weights(conductance))
+
+
+
+
+
+
+    
+    def get_conductance_from_state(self, state, flag=True):
+        if flag:
+            return self.potentiation_approximator.predict(state)
+        return self.depression_approximator.predict(state)
+
+    def get_state_from_conductance(self, conductance, flag=True):
+        if flag:
+            return self.potentiation_approximator.inverse(conductance)
+        return self.depression_approximator.inverse(conductance)
+
+
+    def map_weights_to_conductances(self, weight):
+
+        normalized_weight = (weight - self.min_weight) / (self.max_weight - self.min_weight)
+
+        normalized_conductance = normalized_weight
+
+        return normalized_conductance * (self.max_conductance - self.min_conductance) + self.min_conductance
+    
+    def map_conductances_to_weights(self, conductance):
+        normalized_conductance = (conductance - self.min_conductance) / (self.max_conductance - self.min_conductance)
+
+        normalized_weight = normalized_conductance
+
+        return normalized_weight * (self.max_weight - self.min_weight) + self.min_weight
+    
+
+        
+
+        
+
+
